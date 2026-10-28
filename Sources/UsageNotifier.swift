@@ -1,109 +1,6 @@
 import AppKit
 import SwiftUI
 
-struct UsageWindow: Decodable {
-    let name: String
-    let used: Double
-    let resetsAt: Double
-    var remaining: Double { max(0, min(100, 100 - used)) }
-}
-
-struct ServiceUsage: Decodable {
-    let name: String
-    var plan = ""
-    var windows: [UsageWindow]? = nil
-    var error = ""
-    var updatedAt: Double = 0
-    var nextAttempt: Double = 0
-}
-
-final class UsageModel: ObservableObject {
-    @Published var services = [ServiceUsage(name: "Codex"), ServiceUsage(name: "Claude")]
-    @Published var loading = false
-    private var process: Process?
-    private var input: FileHandle?
-    private var output: FileHandle?
-    private var buffer = Data()
-    private var pending = Set<String>()
-    private var timer: Timer?
-    private var stopping = false
-
-    func start() {
-        guard process == nil else { return }
-        guard let executable = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("usage-helper") else { return }
-        let process = Process()
-        let stdin = Pipe(), stdout = Pipe()
-        process.executableURL = executable
-        process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = FileHandle.nullDevice
-        // A read-only usage query should not inherit this project's Codex config.
-        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
-        output = stdout.fileHandleForReading
-        output?.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if data.isEmpty { handle.readabilityHandler = nil; return }
-            DispatchQueue.main.async { self?.receive(data) }
-        }
-        process.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self, !self.stopping else { return }
-                self.process = nil
-                self.input = nil
-                self.loading = false
-                for index in self.services.indices {
-                    self.services[index].error = "Usage reader stopped. Click refresh to reconnect."
-                }
-            }
-        }
-        do {
-            try process.run()
-            self.process = process
-            input = stdin.fileHandleForWriting
-            refresh()
-            timer?.invalidate()
-            timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refresh() }
-        } catch {
-            output?.readabilityHandler = nil
-            for index in services.indices { services[index].error = "Could not start usage reader. Rebuild the app." }
-        }
-    }
-
-    func refresh() {
-        guard !loading else { return }
-        guard let input else { start(); return }
-        pending = ["Codex", "Claude"]
-        loading = true
-        do { try input.write(contentsOf: Data("refresh\n".utf8)) }
-        catch {
-            loading = false
-            process?.terminate()
-        }
-    }
-
-    private func receive(_ data: Data) {
-        buffer.append(data)
-        while let end = buffer.firstIndex(of: 10) {
-            let line = buffer[..<end]
-            if let usage = try? JSONDecoder().decode(ServiceUsage.self, from: line),
-               let index = services.firstIndex(where: { $0.name == usage.name }) {
-                services[index] = usage
-                pending.remove(usage.name)
-            }
-            buffer.removeSubrange(...end)
-        }
-        loading = !pending.isEmpty
-    }
-
-    func stop() {
-        stopping = true
-        timer?.invalidate()
-        output?.readabilityHandler = nil
-        try? input?.close()
-        if let process, process.isRunning { process.terminate() }
-    }
-}
-
 private func countdown(_ seconds: TimeInterval) -> String {
     if seconds <= 0 { return "now" }
     let minutes = max(1, Int(ceil(seconds / 60)))
@@ -257,6 +154,7 @@ private final class UsagePanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = UsageModel()
     private var panel: NSPanel?
@@ -291,7 +189,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         positionPanel()
         panel.orderFrontRegardless()
         // Preserve the top edge as loading/error/model-specific rows change height.
-        resizeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.resizePanel() }
+        resizeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.resizePanel() }
+        }
         NotificationCenter.default.addObserver(self, selector: #selector(positionPanel), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         model.start()
     }
@@ -324,7 +224,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 @main
 struct UsageNotifier {
-    static func main() {
+    @MainActor
+    static func main() async {
+        if CommandLine.arguments.contains("--once") {
+            await withTaskGroup(of: ServiceUsage.self) { group in
+                for provider in UsageProvider.allCases {
+                    group.addTask {
+                        var usage = ServiceUsage(name: provider.rawValue)
+                        usage.merge(await provider.fetch(), now: Date(), interval: provider.interval)
+                        return usage
+                    }
+                }
+                for await usage in group {
+                    if var data = try? JSONEncoder().encode(usage) {
+                        data.append(10)
+                        try? FileHandle.standardOutput.write(contentsOf: data)
+                    }
+                }
+            }
+            return
+        }
+        runApplication()
+    }
+
+    @MainActor
+    private static func runApplication() {
         let application = NSApplication.shared
         let delegate = AppDelegate()
         application.delegate = delegate

@@ -9,14 +9,14 @@ A small native macOS floating card showing your **remaining Codex and Claude cap
 
 ## Build and run
 
-Requires macOS 13+, Apple Command Line Tools, and Go 1.24+ to build. Log in with the Codex and Claude CLIs first.
+Requires macOS 13+ and Apple Command Line Tools to build. Log in with the Codex and Claude CLIs first.
 
 ```sh
 ./scripts/build.sh
 open "build/Usage Notifier.app"
 ```
 
-You can move the built app into Applications. Go is bundled as a compiled helper and is not required to run it. The installed Codex CLI is required at runtime; Claude credentials come from your existing Claude Code login.
+You can move the built app into Applications. The app is written entirely in Swift, with native provider queries running asynchronously alongside the UI. The installed Codex CLI is required at runtime; Claude credentials come from your existing Claude Code login.
 
 ## Behavior
 
@@ -34,18 +34,18 @@ Codex uses the local CLI's [`account/rateLimits/read` app-server method](https:/
 
 Claude uses `https://api.anthropic.com/api/oauth/usage` with Claude Code's OAuth credentials from the macOS Keychain (`Claude Code-credentials`), falling back to `$CLAUDE_CONFIG_DIR/.credentials.json` or `~/.claude/.credentials.json`. Supports the legacy window response and newer scoped model limits used by `ai-usage`. This endpoint may change independently of the app.
 
-Tokens stay in the helper's memory and are sent only to Anthropic's usage endpoint. They are never included in app output or saved by Usage Notifier. A Keychain permission prompt may appear on first access.
+Claude tokens stay in the app's memory and are sent only to Anthropic's usage endpoint. They are never included in app output or saved by Usage Notifier. A Keychain permission prompt may appear on first access.
 
 Finder's minimal PATH is supplemented with Homebrew, `~/.local/bin`, and common Nix locations to find Codex.
 
 ## Verify
 
 ```sh
-(cd helper && go test -race ./... && go vet ./...)
+./scripts/test.sh
 ```
 
-For a live diagnostic, the bundled helper prints usage-only JSON (no tokens):
+For a live diagnostic, the app prints usage-only JSON (no tokens) without opening a window:
 
 ```sh
-"build/Usage Notifier.app/Contents/MacOS/usage-helper" --once
+"build/Usage Notifier.app/Contents/MacOS/UsageNotifier" --once
 ```
