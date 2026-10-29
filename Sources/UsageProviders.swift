@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import LocalAuthentication
 import Darwin
 
 enum UsageProvider: String, CaseIterable, Sendable {
@@ -20,8 +21,8 @@ enum UsageProvider: String, CaseIterable, Sendable {
     }
 }
 
-struct ClaudeCredentials: Decodable, Sendable {
-    struct OAuth: Decodable, Sendable {
+struct ClaudeCredentials: Codable, Sendable {
+    struct OAuth: Codable, Sendable {
         let accessToken: String
         let subscriptionType: String?
     }
@@ -35,21 +36,37 @@ struct ClaudeCredentials: Decodable, Sendable {
         return credentials
     }
 
-    static func read() throws -> ClaudeCredentials {
+    static func read(
+        directory: URL? = nil,
+        allowInteraction: Bool = false,
+        copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching
+    ) throws -> ClaudeCredentials {
+        // The login-session agent serializes access. Only its single authorization
+        // attempt may enable legacy Keychain UI; normal app reads stay silent.
+        let interactionStatus = SecKeychainSetUserInteractionAllowed(allowInteraction)
+        defer { if allowInteraction { SecKeychainSetUserInteractionAllowed(false) } }
+        let context = LAContext()
+        context.interactionNotAllowed = !allowInteraction
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
             kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: context
         ]
         var item: CFTypeRef?
-        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+        let status = interactionStatus == errSecSuccess
+            ? copyMatching(query as CFDictionary, &item) : interactionStatus
+        if status == errSecSuccess,
            let data = item as? Data, let credentials = try? decode(data) {
             return credentials
         }
-        let directory = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"].map { URL(fileURLWithPath: $0) }
+        let directory = directory ?? ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"].map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
         guard let data = try? Data(contentsOf: directory.appendingPathComponent(".credentials.json")) else {
+            if status != errSecSuccess && status != errSecItemNotFound {
+                throw UsageFailure("Claude access was not authorized; try again after your next macOS login")
+            }
             throw UsageFailure("Claude credentials not found; run `claude auth login`")
         }
         return try decode(data)
@@ -121,7 +138,7 @@ enum ClaudeClient {
 
     static func fetch() async throws -> UsageResult {
         let credentials: ClaudeCredentials
-        do { credentials = try await Task.detached(priority: .utility) { try ClaudeCredentials.read() }.value }
+        do { credentials = try await Task.detached(priority: .utility) { try CredentialAgentClient.read() }.value }
         catch { return UsageResult(error: error.localizedDescription, retry: 60) }
         try Task.checkCancellation()
         return try await fetch(credentials: credentials, session: session)

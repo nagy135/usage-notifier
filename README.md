@@ -34,7 +34,9 @@ Codex uses the local CLI's [`account/rateLimits/read` app-server method](https:/
 
 Claude uses `https://api.anthropic.com/api/oauth/usage` with Claude Code's OAuth credentials from the macOS Keychain (`Claude Code-credentials`), falling back to `$CLAUDE_CONFIG_DIR/.credentials.json` or `~/.claude/.credentials.json`. Supports the legacy window response and newer scoped model limits used by `ai-usage`. This endpoint may change independently of the app.
 
-Claude tokens stay in the app's memory and are sent only to Anthropic's usage endpoint. They are never included in app output or saved by Usage Notifier. A Keychain permission prompt may appear on first access.
+Claude tokens stay in memory and are sent only to Anthropic's usage endpoint. They are never included in app output or saved to disk by Usage Notifier. If silent Keychain access and the credentials file are unavailable, a small login-session helper allows **one authorization attempt per macOS login**. After you approve, it keeps the credentials in memory across closing and reopening the card. Normal refreshes try to pick up credentials renewed by Claude Code silently, falling back to the in-memory credentials. Cancelling authorization does not trigger repeated prompts; the card shows an access error until the next macOS login.
+
+The app registers `~/Library/LaunchAgents/local.usage-notifier.credentials.plist` on demand. The helper starts only when needed and exits at logout, clearing its memory cache. It communicates over a local XPC connection restricted to the same user and the app's signing identifier. A nonsecret login-session marker in `~/Library/Application Support/UsageNotifier/credential-prompt-session` prevents repeated prompts even if the helper crashes or restarts. If the helper restarts and cannot read Keychain silently, its lost memory cache cannot be recovered until the next login. To remove the helper, run `launchctl bootout gui/$(id -u)/local.usage-notifier.credentials` and delete its LaunchAgent plist.
 
 Finder's minimal PATH is supplemented with Homebrew, `~/.local/bin`, and common Nix locations to find Codex.
 

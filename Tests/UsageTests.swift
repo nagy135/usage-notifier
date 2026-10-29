@@ -1,5 +1,7 @@
 import Foundation
 import Darwin
+import Security
+import LocalAuthentication
 
 private struct TestFailure: Error, CustomStringConvertible {
     let description: String
@@ -126,6 +128,86 @@ struct UsageTests {
                 _ = try ClaudeCredentials.decode(bytes(#"{"claudeAiOauth":{"accessToken":""}}"#))
                 throw TestFailure(description: "empty token accepted")
             } catch is UsageFailure {}
+        }
+
+        try await test("Keychain reads suppress modern authentication and legacy permission dialogs") {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let fixture = bytes(#"{"claudeAiOauth":{"accessToken":"fixture-token"}}"#)
+            var attempted = false
+            let credentials = try ClaudeCredentials.read(directory: directory) { query, result in
+                attempted = true
+                let query = query as! [String: Any]
+                let context = query[kSecUseAuthenticationContext as String] as? LAContext
+                var allowed: DarwinBoolean = true
+                let status = SecKeychainGetUserInteractionAllowed(&allowed)
+                guard status == errSecSuccess, !allowed.boolValue,
+                      context?.interactionNotAllowed == true else { return errSecParam }
+                result?.pointee = fixture as CFData
+                return errSecSuccess
+            }
+            try expect(attempted && credentials.claudeAiOauth.accessToken == "fixture-token", "noninteractive Keychain read failed")
+        }
+        try await test("Denied or locked Keychain falls back to a credentials file without prompting") {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            try bytes(#"{"claudeAiOauth":{"accessToken":"file-token"}}"#).write(to: directory.appendingPathComponent(".credentials.json"))
+            for status in [errSecInteractionNotAllowed, errSecAuthFailed, errSecItemNotFound] {
+                let credentials = try ClaudeCredentials.read(directory: directory) { _, _ in status }
+                try expect(credentials.claudeAiOauth.accessToken == "file-token", "lost file fallback")
+            }
+            try FileManager.default.removeItem(at: directory.appendingPathComponent(".credentials.json"))
+            for _ in 0..<3 {
+                do {
+                    _ = try ClaudeCredentials.read(directory: directory) { _, _ in errSecInteractionNotAllowed }
+                    throw TestFailure(description: "denied credentials accepted")
+                } catch let error as UsageFailure {
+                    try expect(error.message.contains("next macOS login"), "missing access error")
+                }
+            }
+        }
+
+        try await test("Session reuses authorized credentials across card restarts and picks up silent refreshes") {
+            let fixture = try ClaudeCredentials.decode(bytes(#"{"claudeAiOauth":{"accessToken":"authorized"}}"#))
+            let renewed = try ClaudeCredentials.decode(bytes(#"{"claudeAiOauth":{"accessToken":"renewed"}}"#))
+            var interactiveReads = 0
+            var canReadSilently = false
+            var session = CredentialSession(readCredentials: { interactive in
+                if interactive { interactiveReads += 1; return fixture }
+                if canReadSilently { return renewed }
+                throw UsageFailure("interaction required")
+            }, claimPrompt: { true })
+            for _ in 0..<5 {
+                let credentials = try session.read()
+                try expect(credentials.claudeAiOauth.accessToken == "authorized", "lost session cache")
+            }
+            try expect(interactiveReads == 1, "repeated authorization")
+            canReadSilently = true
+            let credentials = try session.read()
+            try expect(credentials.claudeAiOauth.accessToken == "renewed", "ignored refreshed CLI token")
+        }
+        try await test("Cancelled authorization never prompts again in the same login, even after helper restart") {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            var interactiveReads = 0
+            func makeSession(_ login: String) -> CredentialSession {
+                CredentialSession(readCredentials: { interactive in
+                    if interactive { interactiveReads += 1 }
+                    throw UsageFailure("cancelled")
+                }, claimPrompt: { LoginPromptPermit.claim(session: login, directory: directory) })
+            }
+            for _ in 0..<3 {
+                var session = makeSession("login-one")
+                for _ in 0..<3 {
+                    do { _ = try session.read(); throw TestFailure(description: "cancelled access succeeded") }
+                    catch is UsageFailure {}
+                }
+            }
+            try expect(interactiveReads == 1, "restarted helper prompted twice")
+            var nextLogin = makeSession("login-two")
+            do { _ = try nextLogin.read(); throw TestFailure(description: "cancelled access succeeded") }
+            catch is UsageFailure {}
+            try expect(interactiveReads == 2, "new login did not reset authorization allowance")
         }
 
         let configuration = URLSessionConfiguration.ephemeral

@@ -226,6 +226,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct UsageNotifier {
     @MainActor
     static func main() async {
+        if CommandLine.arguments.contains("--credential-agent") {
+            CredentialAgent.run()
+            return
+        }
         if CommandLine.arguments.contains("--once") {
             await withTaskGroup(of: ServiceUsage.self) { group in
                 for provider in UsageProvider.allCases {
